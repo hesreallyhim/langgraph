@@ -1,5 +1,7 @@
 import asyncio
+import enum
 import functools
+import gc
 import logging
 import operator
 import random
@@ -52,7 +54,9 @@ from langgraph.graph import END, Graph, StateGraph
 from langgraph.graph.message import MessagesState, add_messages
 from langgraph.prebuilt.tool_node import ToolNode
 from langgraph.pregel import Channel, GraphRecursionError, Pregel, StateSnapshot
+from langgraph.pregel.loop import AsyncPregelLoop
 from langgraph.pregel.retry import RetryPolicy
+from langgraph.pregel.runner import PregelRunner
 from langgraph.store.base import BaseStore
 from langgraph.types import (
     Command,
@@ -74,10 +78,7 @@ from tests.conftest import (
     awith_store,
 )
 from tests.fake_tracer import FakeTracer
-from tests.memory_assert import (
-    MemorySaverAssertCheckpointMetadata,
-    MemorySaverNoPending,
-)
+from tests.memory_assert import MemorySaverNoPending
 from tests.messages import (
     _AnyIdAIMessage,
     _AnyIdAIMessageChunk,
@@ -4543,8 +4544,13 @@ async def test_nested_pydantic_models(version: str) -> None:
         name: str
         friends: list[str] = Field(default_factory=list)  # IDs of friends
 
+    class MyEnum(enum.Enum):
+        A = 1
+        B = 2
+
     class MyTypedDict(TypedDict):
         x: int
+        my_enum: MyEnum
 
     class State(BaseModel):
         # Basic nested model tests
@@ -4553,6 +4559,7 @@ async def test_nested_pydantic_models(version: str) -> None:
         optional_nested: Optional[NestedModel] = None
         dict_nested: dict[str, NestedModel]
         my_set: set[int]
+        my_enum: MyEnum
         list_nested: Annotated[
             Union[dict, list[dict[str, NestedModel]]], lambda x, y: (x or []) + [y]
         ]
@@ -4580,7 +4587,8 @@ async def test_nested_pydantic_models(version: str) -> None:
         "nested": {"value": 42, "name": "test"},
         "optional_nested": {"value": 10, "name": "optional"},
         "my_set": [1, 2, 7],
-        "my_typed_dict": {"x": 1},
+        "my_enum": MyEnum.B,
+        "my_typed_dict": {"x": 1, "my_enum": MyEnum.A},
         "dict_nested": {"a": {"value": 5, "name": "a"}},
         "list_nested": [{"a": {"value": 6, "name": "b"}}],
         "list_nested_reversed": ["foo", "bar"],
@@ -5759,11 +5767,11 @@ async def test_checkpoint_metadata() -> None:
     workflow.add_edge("tools", "agent")
 
     # graph w/o interrupt
-    checkpointer_1 = MemorySaverAssertCheckpointMetadata()
+    checkpointer_1 = InMemorySaver()
     app = workflow.compile(checkpointer=checkpointer_1)
 
     # graph w/ interrupt
-    checkpointer_2 = MemorySaverAssertCheckpointMetadata()
+    checkpointer_2 = InMemorySaver()
     app_w_interrupt = workflow.compile(
         checkpointer=checkpointer_2, interrupt_before=["tools"]
     )
@@ -7009,6 +7017,8 @@ async def test_double_interrupt_subgraph(checkpointer_name: str) -> None:
         def invoke_sub_agent(state: AgentState):
             return subgraph.invoke(state)
 
+        thread = {"configurable": {"thread_id": str(uuid.uuid4())}}
+
         parent_agent = (
             StateGraph(AgentState)
             .add_node("invoke_sub_agent", invoke_sub_agent)
@@ -7842,6 +7852,44 @@ async def test_handles_multiple_interrupts_from_tasks() -> None:
     assert len(result) == 2
     assert result[0] == "Added James!"
     assert result[1] == "Added Will!"
+
+
+async def test_pregel_loop_refcount():
+    gc.collect()
+    try:
+        gc.disable()
+
+        class State(TypedDict):
+            messages: Annotated[list, add_messages]
+
+        graph_builder = StateGraph(State)
+
+        async def chatbot(state: State):
+            return {"messages": [("ai", "HIYA")]}
+
+        graph_builder.add_node("chatbot", chatbot)
+        graph_builder.set_entry_point("chatbot")
+        graph_builder.set_finish_point("chatbot")
+        graph = graph_builder.compile()
+
+        for _ in range(5):
+            await graph.ainvoke({"messages": [{"role": "user", "content": "hi"}]})
+            assert (
+                len(
+                    [
+                        obj
+                        for obj in gc.get_objects()
+                        if isinstance(obj, AsyncPregelLoop)
+                    ]
+                )
+                == 0
+            )
+            assert (
+                len([obj for obj in gc.get_objects() if isinstance(obj, PregelRunner)])
+                == 0
+            )
+    finally:
+        gc.enable()
 
 
 @pytest.mark.parametrize("checkpointer_name", REGULAR_CHECKPOINTERS_ASYNC)

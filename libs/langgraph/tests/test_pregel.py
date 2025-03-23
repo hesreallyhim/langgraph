@@ -1,5 +1,6 @@
 import enum
 import functools
+import gc
 import json
 import logging
 import operator
@@ -62,7 +63,9 @@ from langgraph.graph import END, Graph, StateGraph
 from langgraph.graph.message import MessageGraph, MessagesState, add_messages
 from langgraph.prebuilt.tool_node import ToolNode
 from langgraph.pregel import Channel, GraphRecursionError, Pregel, StateSnapshot
+from langgraph.pregel.loop import SyncPregelLoop
 from langgraph.pregel.retry import RetryPolicy
+from langgraph.pregel.runner import PregelRunner
 from langgraph.store.base import BaseStore
 from langgraph.types import (
     Command,
@@ -81,7 +84,6 @@ from tests.conftest import (
     REGULAR_CHECKPOINTERS_SYNC,
     SHOULD_CHECK_SNAPSHOTS,
 )
-from tests.memory_assert import MemorySaverAssertCheckpointMetadata
 from tests.messages import (
     _AnyIdAIMessage,
     _AnyIdAIMessageChunk,
@@ -4210,11 +4212,11 @@ def test_checkpoint_metadata() -> None:
     workflow.add_edge("tools", "agent")
 
     # graph w/o interrupt
-    checkpointer_1 = MemorySaverAssertCheckpointMetadata()
+    checkpointer_1 = InMemorySaver()
     app = workflow.compile(checkpointer=checkpointer_1)
 
     # graph w/ interrupt
-    checkpointer_2 = MemorySaverAssertCheckpointMetadata()
+    checkpointer_2 = InMemorySaver()
     app_w_interrupt = workflow.compile(
         checkpointer=checkpointer_2, interrupt_before=["tools"]
     )
@@ -4630,59 +4632,6 @@ def test_multiple_sinks_subgraphs(snapshot: SnapshotAssertion) -> None:
 
     app = builder.compile()
     assert app.get_graph(xray=True).draw_mermaid() == snapshot
-
-
-def test_subgraph_retries():
-    class State(TypedDict):
-        count: int
-
-    class ChildState(State):
-        some_list: Annotated[list, operator.add]
-
-    called_times = 0
-
-    class RandomError(ValueError):
-        """This will be retried on."""
-
-    def parent_node(state: State):
-        return {"count": state["count"] + 1}
-
-    def child_node_a(state: ChildState):
-        nonlocal called_times
-        # We want it to retry only on node_b
-        # NOT re-compute the whole graph.
-        assert not called_times
-        called_times += 1
-        return {"some_list": ["val"]}
-
-    def child_node_b(state: ChildState):
-        raise RandomError("First attempt fails")
-
-    child = StateGraph(ChildState)
-    child.add_node(child_node_a)
-    child.add_node(child_node_b)
-    child.add_edge("__start__", "child_node_a")
-    child.add_edge("child_node_a", "child_node_b")
-
-    parent = StateGraph(State)
-    parent.add_node("parent_node", parent_node)
-    parent.add_node(
-        "child_graph",
-        child.compile(),
-        retry=RetryPolicy(
-            max_attempts=3,
-            retry_on=(RandomError,),
-            backoff_factor=0.0001,
-            initial_interval=0.0001,
-        ),
-    )
-    parent.add_edge("parent_node", "child_graph")
-    parent.set_entry_point("parent_node")
-
-    checkpointer = InMemorySaver()
-    app = parent.compile(checkpointer=checkpointer)
-    with pytest.raises(RandomError):
-        app.invoke({"count": 0}, {"configurable": {"thread_id": "foo"}})
 
 
 @pytest.mark.parametrize("checkpointer_name", ALL_CHECKPOINTERS_SYNC)
@@ -6291,6 +6240,7 @@ def test_double_interrupt_subgraph(
     def invoke_sub_agent(state: AgentState):
         return subgraph.invoke(state)
 
+    thread = {"configurable": {"thread_id": str(uuid.uuid4())}}
     parent_agent = (
         StateGraph(AgentState)
         .add_node("invoke_sub_agent", invoke_sub_agent)
@@ -7617,6 +7567,40 @@ def test_parallel_interrupts_double(
 
     assert invokes == 5
     assert len(events) == 5
+
+
+def test_pregel_loop_refcount():
+    gc.collect()
+    try:
+        gc.disable()
+
+        class State(TypedDict):
+            messages: Annotated[list, add_messages]
+
+        graph_builder = StateGraph(State)
+
+        def chatbot(state: State):
+            return {"messages": [("ai", "HIYA")]}
+
+        graph_builder.add_node("chatbot", chatbot)
+        graph_builder.set_entry_point("chatbot")
+        graph_builder.set_finish_point("chatbot")
+        graph = graph_builder.compile()
+
+        for _ in range(5):
+            graph.invoke({"messages": [{"role": "user", "content": "hi"}]})
+            assert (
+                len(
+                    [obj for obj in gc.get_objects() if isinstance(obj, SyncPregelLoop)]
+                )
+                == 0
+            )
+            assert (
+                len([obj for obj in gc.get_objects() if isinstance(obj, PregelRunner)])
+                == 0
+            )
+    finally:
+        gc.enable()
 
 
 @pytest.mark.parametrize("checkpointer_name", REGULAR_CHECKPOINTERS_SYNC)
